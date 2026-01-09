@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Focus Tracker – EAR Drowsiness</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<link rel="stylesheet" href="styles.css">
+</head>
+
+<body data-theme="pastel-green">
+
+<div class="app-shell">
+  <header class="app-header">
+    <div class="app-title-group">
+      <div class="app-title">Focus Aura</div>
+      <div class="app-subtitle">Gentle, real-time focus guidance for deep study sessions.</div>
+    </div>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <div class="status-pill">
+        <span class="status-dot"></span>
+        <span id="sessionStatusLabel">Idle</span>
+      </div>
+      <div class="theme-toggle-group" aria-label="Theme switcher">
+        <button class="theme-toggle-btn is-active" data-theme-btn data-theme-value="pastel-green" type="button">
+          <span></span> Calm Green
+        </button>
+        <button class="theme-toggle-btn" data-theme-btn data-theme-value="pastel-purple" type="button">
+          <span></span> Soft Purple
+        </button>
+        <button class="theme-toggle-btn" data-theme-btn data-theme-value="full-black" type="button">
+          <span></span> Night
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="main-layout">
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Camera Focus View</div>
+          <div class="card-caption">Keep your eyes softly on the screen — we’ll handle the rest.</div>
+        </div>
+      </div>
+
+      <div class="camera-wrapper">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="canvas"></canvas>
+      </div>
+
+      <div class="session-controls">
+        <div class="button-row">
+          <button class="btn btn-primary" id="startBtn" type="button" onclick="startCamera()">
+            Start Session
+          </button>
+          <button class="btn btn-soft" id="stopBtn" type="button" onclick="stopCamera()">
+            Pause
+          </button>
+        </div>
+        <div id="sessionPill" class="session-pill">
+          <span class="session-dot"></span>
+          <span id="sessionStatusText">Ready when you are.</span>
+        </div>
+      </div>
+    </section>
+
+    <aside class="card">
+      <div class="card-header">
+        <div>
+          <div class="card-title">Focus Metrics</div>
+          <div class="card-caption">Gentle indicators to keep you aware without pressure.</div>
+        </div>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card timer-card">
+          <div class="metric-label">Study Timer</div>
+          <div class="timer-display" id="timerDisplay">00:00:00</div>
+          <div class="timer-controls">
+            <div class="timer-input-group">
+              <input type="number" id="timerHours" class="timer-input" min="0" max="23" value="0" placeholder="0">
+              <span class="timer-separator">:</span>
+              <input type="number" id="timerMinutes" class="timer-input" min="0" max="59" value="25" placeholder="25">
+              <span class="timer-separator">:</span>
+              <input type="number" id="timerSeconds" class="timer-input" min="0" max="59" value="0" placeholder="0">
+            </div>
+            <div class="timer-buttons">
+              <button class="timer-btn timer-btn-start" id="timerStartBtn" onclick="startTimer()">Start</button>
+              <button class="timer-btn timer-btn-pause" id="timerPauseBtn" onclick="pauseTimer()" style="display:none;">Pause</button>
+              <button class="timer-btn timer-btn-reset" id="timerResetBtn" onclick="resetTimer()">Reset</button>
+            </div>
+          </div>
+          <div class="metric-sub">Set your study session duration and stay focused.</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-label">Eye Aspect Ratio</div>
+          <div class="metric-value"><span id="earVal">-</span></div>
+          <div class="metric-sub">Lower values indicate closing or looking away.</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-label">Blink Count</div>
+          <div class="metric-value"><span id="blinkCount">0</span></div>
+          <div class="metric-sub">Healthy blinking keeps your eyes relaxed.</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-label">Session Status</div>
+          <div class="metric-value"><span id="sessionStatus">Idle</span></div>
+          <div class="metric-sub">Updates as you focus, blink, or look away.</div>
+        </div>
+
+        <div class="metric-card">
+          <div class="metric-label">Focus Message</div>
+          <div class="status-text" id="status">Waiting…</div>
+        </div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<script>
+/* --------- CONFIG --------- */
+// Eye Aspect Ratio (EAR) landmark indices for MediaPipe Face Mesh
+// Standard EAR indices: [left, top-left, top-right, right, bottom-right, bottom-left]
+// These are the 6 points used in EAR = (A + B) / (2 * C) where:
+// A = vertical distance (points 1-5), B = vertical distance (points 2-4), C = horizontal distance (points 0-3)
+const LEFT_EYE = [33, 160, 158, 133, 153, 144];
+const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
+
+const EAR_THRESHOLD = 0.23; // Below this = eyes closed
+const EAR_LOOK_AWAY_THRESHOLD = 0.15; // Very low EAR = looking away
+const CLOSED_TIME_THRESHOLD = 3.0; // seconds before drowsy alarm
+const LOOK_AWAY_TIME_THRESHOLD = 1.0; // seconds before look away warning
+
+/* --------- DOM --------- */
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const earEl = document.getElementById("earVal");
+const blinkEl = document.getElementById("blinkCount");
+const sessionStatusEl = document.getElementById("sessionStatus");
+const sessionStatusLabelEl = document.getElementById("sessionStatusLabel");
+const sessionStatusTextEl = document.getElementById("sessionStatusText");
+
+/* --------- STATE --------- */
+let stream = null;
+let lastEAR = 1;
+let eyesClosedSince = null;
+let lookingAwaySince = null;
+let noFaceSince = null;
+let alarmPlaying = false;
+let currentLeftEyePoints = null;
+let currentRightEyePoints = null;
+let blinkCount = 0;
+let wasEyeClosed = false;
+
+/* --------- TIMER STATE --------- */
+let timerInterval = null;
+let timerTotalSeconds = 0;
+let timerRemainingSeconds = 0;
+let timerIsRunning = false;
+let timerIsPaused = false;
+
+/* --------- TIMER FUNCTIONS --------- */
+function formatTime(seconds) {
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function updateTimerDisplay() {
+  const displayEl = document.getElementById('timerDisplay');
+  if (!displayEl) return;
+  
+  displayEl.textContent = formatTime(timerRemainingSeconds);
+  
+  // Add warning class when less than 1 minute remaining
+  if (timerRemainingSeconds > 0 && timerRemainingSeconds <= 60) {
+    displayEl.classList.add('warning');
+  } else {
+    displayEl.classList.remove('warning');
+  }
+}
+
+function startTimer() {
+  const hoursInput = document.getElementById('timerHours');
+  const minutesInput = document.getElementById('timerMinutes');
+  const secondsInput = document.getElementById('timerSeconds');
+  const startBtn = document.getElementById('timerStartBtn');
+  const pauseBtn = document.getElementById('timerPauseBtn');
+  
+  if (!timerIsRunning && !timerIsPaused) {
+    // Get values from inputs
+    const hours = parseInt(hoursInput.value) || 0;
+    const minutes = parseInt(minutesInput.value) || 0;
+    const seconds = parseInt(secondsInput.value) || 0;
+    
+    timerTotalSeconds = hours * 3600 + minutes * 60 + seconds;
+    timerRemainingSeconds = timerTotalSeconds;
+    
+    if (timerTotalSeconds <= 0) {
+      alert('Please set a valid timer duration.');
+      return;
+    }
+    
+    // Disable inputs while timer is running
+    hoursInput.disabled = true;
+    minutesInput.disabled = true;
+    secondsInput.disabled = true;
+  }
+  
+  timerIsRunning = true;
+  timerIsPaused = false;
+  
+  startBtn.style.display = 'none';
+  pauseBtn.style.display = 'inline-flex';
+  
+  timerInterval = setInterval(() => {
+    if (timerRemainingSeconds > 0) {
+      timerRemainingSeconds--;
+      updateTimerDisplay();
+    } else {
+      // Timer finished
+      clearInterval(timerInterval);
+      timerInterval = null;
+      timerIsRunning = false;
+      timerIsPaused = false;
+      
+      // Play alarm
+      startAlarm();
+      
+      // Show notification
+      alert('Study session complete! 🎉 Time for a well-deserved break.');
+      
+      // Reset UI
+      startBtn.style.display = 'inline-flex';
+      pauseBtn.style.display = 'none';
+      hoursInput.disabled = false;
+      minutesInput.disabled = false;
+      secondsInput.disabled = false;
+      
+      // Reset timer
+      resetTimer();
+    }
+  }, 1000);
+  
+  updateTimerDisplay();
+}
+
+function pauseTimer() {
+  if (!timerIsRunning) return;
+  
+  clearInterval(timerInterval);
+  timerInterval = null;
+  timerIsRunning = false;
+  timerIsPaused = true;
+  
+  const startBtn = document.getElementById('timerStartBtn');
+  const pauseBtn = document.getElementById('timerPauseBtn');
+  startBtn.style.display = 'inline-flex';
+  pauseBtn.style.display = 'none';
+}
+
+function resetTimer() {
+  clearInterval(timerInterval);
+  timerInterval = null;
+  timerIsRunning = false;
+  timerIsPaused = false;
+  
+  timerRemainingSeconds = 0;
+  timerTotalSeconds = 0;
+  
+  const hoursInput = document.getElementById('timerHours');
+  const minutesInput = document.getElementById('timerMinutes');
+  const secondsInput = document.getElementById('timerSeconds');
+  const startBtn = document.getElementById('timerStartBtn');
+  const pauseBtn = document.getElementById('timerPauseBtn');
+  
+  hoursInput.disabled = false;
+  minutesInput.disabled = false;
+  secondsInput.disabled = false;
+  
+  startBtn.style.display = 'inline-flex';
+  pauseBtn.style.display = 'none';
+  
+  updateTimerDisplay();
+}
+
+/* --------- AUDIO --------- */
+let audioCtx, osc;
+function startAlarm(){
+  if(alarmPlaying) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  osc = audioCtx.createOscillator();
+  osc.frequency.value = 880;
+  osc.connect(audioCtx.destination);
+  osc.start();
+  alarmPlaying = true;
+}
+function stopAlarm(){
+  if(!alarmPlaying) return;
+  osc.stop();
+  osc.disconnect();
+  alarmPlaying = false;
+}
+
+/* --------- HELPERS --------- */
+function dist(a,b){
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+function computeEAR(landmarks, idx){
+  // Safety check: ensure landmarks array exists and has enough elements
+  if(!landmarks || landmarks.length < Math.max(...idx) + 1) return 1.0;
+  
+  // Get all required landmarks
+  const p = idx.map(i => {
+    if(i >= landmarks.length || !landmarks[i]) return null;
+    return landmarks[i];
+  });
+  
+  // Check if all landmarks exist
+  if(p.some(lm => lm === null)) return 1.0;
+  
+  // Calculate EAR: (A + B) / (2 * C)
+  const A = dist(p[1], p[5]);
+  const B = dist(p[2], p[4]);
+  const C = dist(p[0], p[3]);
+  if(C === 0) return 1.0; // Avoid division by zero
+  return (A + B) / (2 * C);
+}
+
+// Draw eye landmarks as points on canvas
+function drawEyePoints(landmarks, eyeIndices, color){
+  // Safety check: ensure landmarks exist and array has enough elements
+  if(!landmarks || landmarks.length === 0 || landmarks.length < Math.max(...eyeIndices) + 1) {
+    return null;
+  }
+  
+  // Check if canvas has valid dimensions
+  if(!canvas || canvas.width === 0 || canvas.height === 0) {
+    return null;
+  }
+  
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 2;
+  
+  const points = [];
+  for(let i = 0; i < eyeIndices.length; i++){
+    const idx = eyeIndices[i];
+    if(idx >= landmarks.length || !landmarks[idx]) {
+      return null; // If any landmark is missing, return null
+    }
+    
+    const landmark = landmarks[idx];
+    points.push({
+      x: landmark.x * canvas.width,
+      y: landmark.y * canvas.height
+    });
+  }
+  
+  if(points.length !== 6) return null; // Need exactly 6 points for EAR
+  
+  // Draw all 6 points for EAR calculation
+  points.forEach((p, idx) => {
+    // Draw point as circle
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 3, 0, 2 * Math.PI);
+    ctx.fill();
+    
+    // Draw label with point index
+    ctx.fillStyle = color;
+    ctx.font = '10px Arial';
+    ctx.fillText(idx, p.x + 5, p.y - 5);
+    ctx.fillStyle = color;
+  });
+  
+  // Draw lines connecting the EAR points (visualize the triangle)
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.globalAlpha = 0.5;
+  
+  // Horizontal line (top to bottom)
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  ctx.lineTo(points[3].x, points[3].y);
+  ctx.stroke();
+  
+  // Vertical lines (left and right)
+  ctx.beginPath();
+  ctx.moveTo(points[1].x, points[1].y);
+  ctx.lineTo(points[5].x, points[5].y);
+  ctx.stroke();
+  
+  ctx.beginPath();
+  ctx.moveTo(points[2].x, points[2].y);
+  ctx.lineTo(points[4].x, points[4].y);
+  ctx.stroke();
+  
+  ctx.globalAlpha = 1.0;
+  
+  return points;
+}
+
+/* --------- THEME SWITCHING --------- */
+const themeButtons = document.querySelectorAll("[data-theme-btn]");
+const bodyEl = document.body;
+
+themeButtons.forEach(btn => {
+  btn.addEventListener("click", () => {
+    const theme = btn.getAttribute("data-theme-value");
+    if(!theme) return;
+
+    bodyEl.setAttribute("data-theme", theme);
+
+    themeButtons.forEach(b => b.classList.remove("is-active"));
+    btn.classList.add("is-active");
+  });
+});
+
+/* --------- FACEMESH --------- */
+const faceMesh = new FaceMesh({
+  locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
+});
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: true
+});
+
+faceMesh.onResults(results => {
+  // Clear canvas
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  
+  // Draw video frame
+  ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+  // Check if face is detected
+  if(!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0){
+    if(noFaceSince === null){
+      noFaceSince = performance.now();
+    }
+    const noFaceTime = (performance.now() - noFaceSince) / 1000;
+    
+    // Reset other timers
+    eyesClosedSince = null;
+    lookingAwaySince = null;
+    currentLeftEyePoints = null;
+    currentRightEyePoints = null;
+    
+    if(noFaceTime >= LOOK_AWAY_TIME_THRESHOLD){
+      statusEl.innerText = "⚠️ NO FACE DETECTED — Please look at the camera!";
+      statusEl.className = "status-bad";
+      startAlarm();
+      sessionStatusEl.innerText = "Away from Screen";
+      sessionStatusLabelEl.innerText = "Paused";
+      sessionStatusTextEl.innerText = "We’ll resume tracking once you’re back in view.";
+    } else {
+      statusEl.innerText = "No face detected — Please look at the camera!";
+      statusEl.className = "status-bad";
+      stopAlarm();
+      sessionStatusEl.innerText = "Not in View";
+      sessionStatusLabelEl.innerText = "Idle";
+      sessionStatusTextEl.innerText = "When you’re ready, sit comfortably and look softly at the screen.";
+    }
+    earEl.innerText = "-";
+    return;
+  }
+  
+  // Reset no face timer when face is detected
+  noFaceSince = null;
+
+  const landmarks = results.multiFaceLandmarks[0];
+
+  // Calculate EAR for both eyes
+  const leftEAR = computeEAR(landmarks, LEFT_EYE);
+  const rightEAR = computeEAR(landmarks, RIGHT_EYE);
+  const avgEAR = (leftEAR + rightEAR) / 2;
+
+  earEl.innerText = avgEAR.toFixed(3);
+
+  // Draw eye points on canvas for visualization
+  currentLeftEyePoints = drawEyePoints(landmarks, LEFT_EYE, '#00ff00'); // Green for left eye
+  currentRightEyePoints = drawEyePoints(landmarks, RIGHT_EYE, '#00ffff'); // Cyan for right eye
+
+  // ---- LOOKING AWAY DETECTION (using EAR method) ----
+  // If EAR is very low, it means eyes are almost closed or looking away
+  // Also check if there's a significant drop in EAR (sudden change)
+  const isLookingAway = avgEAR < EAR_LOOK_AWAY_THRESHOLD || 
+                       (lastEAR > 0.25 && avgEAR < lastEAR - 0.1) ||
+                       leftEAR < 0.1 || rightEAR < 0.1;
+
+  if(isLookingAway){
+    if(lookingAwaySince === null){
+      lookingAwaySince = performance.now();
+    }
+    const awayTime = (performance.now() - lookingAwaySince) / 1000;
+    
+    // Reset drowsiness timer when looking away
+    eyesClosedSince = null;
+    
+    if(awayTime >= LOOK_AWAY_TIME_THRESHOLD){
+      statusEl.innerText = "⚠️ LOOKING AWAY — Please focus on the camera!";
+      statusEl.className = "status-bad";
+      startAlarm();
+      sessionStatusEl.innerText = "Looking Away";
+      sessionStatusLabelEl.innerText = "Gently Refocus";
+      sessionStatusTextEl.innerText = "Bring your attention back to the screen when you’re ready.";
+      lastEAR = avgEAR;
+      return;
+    } else {
+      statusEl.innerText = "Looking away…";
+      statusEl.className = "status-bad";
+      stopAlarm();
+      sessionStatusEl.innerText = "Brief Glance Away";
+      sessionStatusLabelEl.innerText = "Tracking";
+      sessionStatusTextEl.innerText = "Short glances away are okay. We’ll let you know if it continues.";
+      lastEAR = avgEAR;
+      return;
+    }
+  } else {
+    // Reset looking away timer when back to camera
+    if(lookingAwaySince !== null){
+      lookingAwaySince = null;
+      stopAlarm();
+    }
+  }
+
+  // ---- DROWSINESS DETECTION (only if not looking away) ----
+  if(avgEAR < EAR_THRESHOLD){
+    if(eyesClosedSince === null){
+      eyesClosedSince = performance.now();
+    }
+
+    // Blink detection: short closures that don't trigger drowsiness
+    if(!wasEyeClosed) {
+      wasEyeClosed = true;
+    }
+  } else {
+    // If eyes were closed briefly and reopen, count as blink
+    if(wasEyeClosed && eyesClosedSince !== null){
+      const closedTime = (performance.now() - eyesClosedSince) / 1000;
+      if(closedTime < CLOSED_TIME_THRESHOLD){
+        blinkCount += 1;
+        blinkEl.innerText = String(blinkCount);
+      }
+    }
+    wasEyeClosed = false;
+    eyesClosedSince = null;
+    stopAlarm();
+  }
+
+  if(eyesClosedSince !== null){
+    const closedTime = (performance.now() - eyesClosedSince) / 1000;
+
+    if(closedTime >= CLOSED_TIME_THRESHOLD){
+      statusEl.innerText = "DROWSY — WAKE UP!";
+      statusEl.className = "status-bad";
+      startAlarm();
+      sessionStatusEl.innerText = "Drowsy";
+      sessionStatusLabelEl.innerText = "Alert";
+      sessionStatusTextEl.innerText = "Your eyes have been closed for a while. Time for a short break.";
+    } else {
+      statusEl.innerText = `Eyes closed… (${closedTime.toFixed(1)}s)`;
+      statusEl.className = "status-bad";
+      sessionStatusEl.innerText = "Eyes Closed";
+      sessionStatusLabelEl.innerText = "Tracking";
+      sessionStatusTextEl.innerText = "We’ll gently remind you if this continues.";
+    }
+  } else {
+    statusEl.innerText = "Focused ✓";
+    statusEl.className = "status-ok";
+    sessionStatusEl.innerText = "Focused";
+    sessionStatusLabelEl.innerText = "Calm Focus";
+    sessionStatusTextEl.innerText = "Soft gaze on the screen. You’re doing great.";
+  }
+
+  lastEAR = avgEAR;
+});
+
+/* --------- CAMERA LOOP --------- */
+async function startCamera(){
+  stream = await navigator.mediaDevices.getUserMedia({ video:true });
+  video.srcObject = stream;
+  await video.play();
+
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+
+  async function loop(){
+    if(!stream) return;
+    await faceMesh.send({ image: video });
+    requestAnimationFrame(loop);
+  }
+  loop();
+}
+
+function stopCamera(){
+  if(stream){
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  stopAlarm();
+  eyesClosedSince = null;
+  lookingAwaySince = null;
+  noFaceSince = null;
+  statusEl.innerText = "Stopped";
+}
+
+/* --------- INITIALIZE TIMER ON PAGE LOAD --------- */
+document.addEventListener('DOMContentLoaded', () => {
+  updateTimerDisplay();
+});
+</script>
+
+</body>
+</html>
