@@ -2,10 +2,15 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Focus Tracker – EAR Drowsiness</title>
+<title>FocusMate</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.15.0/dist/tf.min.js"></script>
+<script src="https://unpkg.com/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
 <link rel="stylesheet" href="styles.css">
 </head>
 
@@ -14,7 +19,7 @@
 <div class="app-shell">
   <header class="app-header">
     <div class="app-title-group">
-      <div class="app-title">Focus Aura</div>
+      <div class="app-title">FocusMate</div>
       <div class="app-subtitle">Gentle, real-time focus guidance for deep study sessions.</div>
     </div>
     <div style="display:flex; align-items:center; gap:12px;">
@@ -29,12 +34,17 @@
         <button class="theme-toggle-btn" data-theme-btn data-theme-value="pastel-purple" type="button">
           <span></span> Soft Purple
         </button>
-        <button class="theme-toggle-btn" data-theme-btn data-theme-value="full-black" type="button">
-          <span></span> Night
+        <button class="theme-toggle-btn" data-theme-btn data-theme-value="pastel-gold" type="button">
+          <span></span> Soft Gold
         </button>
       </div>
     </div>
   </header>
+
+  <div class="tip-strip" aria-live="polite">
+    <span class="tip-icon">💡</span>
+    <span class="tip-text" id="tipText">Warning triggers only after 5+ seconds of eyes closed — blinks are ignored.</span>
+  </div>
 
   <main class="main-layout">
     <section class="card">
@@ -96,15 +106,15 @@
         </div>
 
         <div class="metric-card">
-          <div class="metric-label">Eye Aspect Ratio</div>
-          <div class="metric-value"><span id="earVal">-</span></div>
-          <div class="metric-sub">Lower values indicate closing or looking away.</div>
+          <div class="metric-label">PERCLOS</div>
+          <div class="metric-value"><span id="perclosVal">-</span></div>
+          <div class="metric-sub">% of time eyes closed (60s window). Warning at 5+ sec sustained closure; blinks ignored (smoothed EAR + hysteresis).</div>
         </div>
-
+        
         <div class="metric-card">
-          <div class="metric-label">Blink Count</div>
-          <div class="metric-value"><span id="blinkCount">0</span></div>
-          <div class="metric-sub">Healthy blinking keeps your eyes relaxed.</div>
+          <div class="metric-label">Phone Detection</div>
+          <div class="metric-value"><span id="phoneStatus">Not Detected</span></div>
+          <div class="metric-sub">Alerts when phone is detected in view.</div>
         </div>
 
         <div class="metric-card">
@@ -118,55 +128,75 @@
           <div class="status-text" id="status">Waiting…</div>
         </div>
       </div>
+
+      <div class="accent-bar" aria-hidden="true"></div>
+
+      <div class="focus-footer">
+        <span class="focus-footer-text">FocusMate · Stay alert, stay present</span>
+      </div>
     </aside>
   </main>
+
+  <footer class="app-footer">
+    <span>PERCLOS-based drowsiness detection · Smoothed EAR + hysteresis</span>
+  </footer>
 </div>
 
 <script>
-/* --------- CONFIG --------- */
-// Eye Aspect Ratio (EAR) landmark indices for MediaPipe Face Mesh
-// Standard EAR indices: [left, top-left, top-right, right, bottom-right, bottom-left]
-// These are the 6 points used in EAR = (A + B) / (2 * C) where:
-// A = vertical distance (points 1-5), B = vertical distance (points 2-4), C = horizontal distance (points 0-3)
 const LEFT_EYE = [33, 160, 158, 133, 153, 144];
 const RIGHT_EYE = [362, 385, 387, 263, 373, 380];
+const PERCLOS_WINDOW_SECONDS = 60.0;
+const PERCLOS_DROWSY_THRESHOLD = 0.5;
+const PERCLOS_ALERT_THRESHOLD = 0.8;
+const EAR_SMOOTH_FRAMES = 11;
+const EAR_THRESHOLD_CLOSED = 0.15;
+const EAR_THRESHOLD_OPEN = 0.23;
+const EYES_CLOSED_WARNING_SECONDS = 5.0;
+const MIN_CLOSURE_BEFORE_COUNT_MS = 650;
+const OCCLUSION_DETECTION_TIME_SECONDS = 2.5;
+const LANDMARK_JITTER_THRESHOLD = 0.05;
+const PERCLOS_VARIANCE_THRESHOLD = 0.2;
+const PHONE_DETECTION_CONFIDENCE = 0.5;
+const PHONE_ALERT_DURATION_SECONDS = 2.0;
+const PHONE_DETECTION_INTERVAL = 5;
 
-const EAR_THRESHOLD = 0.23; // Below this = eyes closed
-const EAR_LOOK_AWAY_THRESHOLD = 0.15; // Very low EAR = looking away
-const CLOSED_TIME_THRESHOLD = 3.0; // seconds before drowsy alarm
-const LOOK_AWAY_TIME_THRESHOLD = 1.0; // seconds before look away warning
-
-/* --------- DOM --------- */
 const video = document.getElementById("video");
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const statusEl = document.getElementById("status");
-const earEl = document.getElementById("earVal");
-const blinkEl = document.getElementById("blinkCount");
+const perclosEl = document.getElementById("perclosVal");
+const phoneStatusEl = document.getElementById("phoneStatus");
 const sessionStatusEl = document.getElementById("sessionStatus");
 const sessionStatusLabelEl = document.getElementById("sessionStatusLabel");
 const sessionStatusTextEl = document.getElementById("sessionStatusText");
 
-/* --------- STATE --------- */
 let stream = null;
-let lastEAR = 1;
-let eyesClosedSince = null;
-let lookingAwaySince = null;
-let noFaceSince = null;
 let alarmPlaying = false;
 let currentLeftEyePoints = null;
 let currentRightEyePoints = null;
-let blinkCount = 0;
-let wasEyeClosed = false;
-
-/* --------- TIMER STATE --------- */
+let perclosFrameHistory = [];
+let earHistory = [];
+let smoothedEarState = 'open';
+const FOCUS_STATE = { FOCUSED: 'FOCUSED', EYES_OCCLUDED: 'EYES_OCCLUDED', ALERT: 'ALERT' };
+let currentFocusState = FOCUS_STATE.FOCUSED;
+let eyeClosedSince = null;
+let eyesOpenSince = null;
+let noFaceSince = null;
+let occlusionDetectedSince = null;
+let previousLeftEyePoints = null;
+let previousRightEyePoints = null;
+let perclosHistory = [];
+const PERCLOS_HISTORY_SIZE = 10;
+let phoneDetectionModel = null;
+let phoneDetectedSince = null;
+let phoneDetectionFrameCount = 0;
+let isPhoneDetected = false;
 let timerInterval = null;
 let timerTotalSeconds = 0;
 let timerRemainingSeconds = 0;
 let timerIsRunning = false;
 let timerIsPaused = false;
 
-/* --------- TIMER FUNCTIONS --------- */
 function formatTime(seconds) {
   const hrs = Math.floor(seconds / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
@@ -179,8 +209,6 @@ function updateTimerDisplay() {
   if (!displayEl) return;
   
   displayEl.textContent = formatTime(timerRemainingSeconds);
-  
-  // Add warning class when less than 1 minute remaining
   if (timerRemainingSeconds > 0 && timerRemainingSeconds <= 60) {
     displayEl.classList.add('warning');
   } else {
@@ -196,7 +224,6 @@ function startTimer() {
   const pauseBtn = document.getElementById('timerPauseBtn');
   
   if (!timerIsRunning && !timerIsPaused) {
-    // Get values from inputs
     const hours = parseInt(hoursInput.value) || 0;
     const minutes = parseInt(minutesInput.value) || 0;
     const seconds = parseInt(secondsInput.value) || 0;
@@ -208,8 +235,6 @@ function startTimer() {
       alert('Please set a valid timer duration.');
       return;
     }
-    
-    // Disable inputs while timer is running
     hoursInput.disabled = true;
     minutesInput.disabled = true;
     secondsInput.disabled = true;
@@ -226,26 +251,17 @@ function startTimer() {
       timerRemainingSeconds--;
       updateTimerDisplay();
     } else {
-      // Timer finished
       clearInterval(timerInterval);
       timerInterval = null;
       timerIsRunning = false;
       timerIsPaused = false;
-      
-      // Play alarm
       startAlarm();
-      
-      // Show notification
       alert('Study session complete! 🎉 Time for a well-deserved break.');
-      
-      // Reset UI
       startBtn.style.display = 'inline-flex';
       pauseBtn.style.display = 'none';
       hoursInput.disabled = false;
       minutesInput.disabled = false;
       secondsInput.disabled = false;
-      
-      // Reset timer
       resetTimer();
     }
   }, 1000);
@@ -292,123 +308,162 @@ function resetTimer() {
   updateTimerDisplay();
 }
 
-/* --------- AUDIO --------- */
-let audioCtx, osc;
+let attentionAudio = null;
 function startAlarm(){
   if(alarmPlaying) return;
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  osc = audioCtx.createOscillator();
-  osc.frequency.value = 880;
-  osc.connect(audioCtx.destination);
-  osc.start();
+  if(!attentionAudio){
+    attentionAudio = new Audio('attention.mp3');
+    attentionAudio.loop = true;
+  }
+  attentionAudio.currentTime = 0;
+  attentionAudio.play().catch(() => {});
   alarmPlaying = true;
 }
 function stopAlarm(){
   if(!alarmPlaying) return;
-  osc.stop();
-  osc.disconnect();
+  if(attentionAudio){
+    attentionAudio.pause();
+    attentionAudio.currentTime = 0;
+  }
   alarmPlaying = false;
 }
 
-/* --------- HELPERS --------- */
-function dist(a,b){
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
-function computeEAR(landmarks, idx){
-  // Safety check: ensure landmarks array exists and has enough elements
+function dist(a,b){ return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function computeEyeClosure(landmarks, idx){
   if(!landmarks || landmarks.length < Math.max(...idx) + 1) return 1.0;
-  
-  // Get all required landmarks
-  const p = idx.map(i => {
-    if(i >= landmarks.length || !landmarks[i]) return null;
-    return landmarks[i];
-  });
-  
-  // Check if all landmarks exist
+  const p = idx.map(i => (i >= landmarks.length || !landmarks[i]) ? null : landmarks[i]);
   if(p.some(lm => lm === null)) return 1.0;
-  
-  // Calculate EAR: (A + B) / (2 * C)
   const A = dist(p[1], p[5]);
   const B = dist(p[2], p[4]);
-  const C = dist(p[0], p[3]);
-  if(C === 0) return 1.0; // Avoid division by zero
-  return (A + B) / (2 * C);
+  const C = dist(p[0], p[3]) + 1e-6;
+  return (A + B) / (2.0 * C);
 }
 
-// Draw eye landmarks as points on canvas
-function drawEyePoints(landmarks, eyeIndices, color){
-  // Safety check: ensure landmarks exist and array has enough elements
-  if(!landmarks || landmarks.length === 0 || landmarks.length < Math.max(...eyeIndices) + 1) {
-    return null;
+function calculatePERCLOS(frameHistory, windowSeconds){
+  const currentTime = performance.now();
+  const windowStart = currentTime - (windowSeconds * 1000);
+  const framesInWindow = frameHistory.filter(frame => frame.timestamp >= windowStart);
+  if(framesInWindow.length === 0) return 0;
+  const closedFrames = framesInWindow.filter(frame => frame.isClosed).length;
+  return (closedFrames / framesInWindow.length) * 100;
+}
+
+function calculateLandmarkJitter(currentPoints, previousPoints){
+  if(!currentPoints || !previousPoints || currentPoints.length !== previousPoints.length) return 0;
+  let maxJitter = 0;
+  for(let i = 0; i < currentPoints.length; i++){
+    const dx = Math.abs(currentPoints[i].x - previousPoints[i].x);
+    const dy = Math.abs(currentPoints[i].y - previousPoints[i].y);
+    maxJitter = Math.max(maxJitter, Math.hypot(dx, dy));
   }
-  
-  // Check if canvas has valid dimensions
-  if(!canvas || canvas.width === 0 || canvas.height === 0) {
-    return null;
+  return maxJitter;
+}
+
+function calculatePERCLOSVariance(perclosHistory){
+  if(perclosHistory.length < 3) return 0;
+  const mean = perclosHistory.reduce((a, b) => a + b, 0) / perclosHistory.length;
+  return perclosHistory.reduce((sum, p) => sum + Math.pow(p - mean, 2), 0) / perclosHistory.length;
+}
+
+function detectOcclusion(leftEyePoints, rightEyePoints, eyeClosureMetric, perclosHistory){
+  if(!leftEyePoints || !rightEyePoints) return true;
+  if(eyeClosureMetric < 0.1) return true;
+  if(previousLeftEyePoints && previousRightEyePoints){
+    const leftJitter = calculateLandmarkJitter(leftEyePoints, previousLeftEyePoints);
+    const rightJitter = calculateLandmarkJitter(rightEyePoints, previousRightEyePoints);
+    if(Math.max(leftJitter, rightJitter) > LANDMARK_JITTER_THRESHOLD) return true;
   }
-  
-  ctx.strokeStyle = color;
-  ctx.fillStyle = color;
-  ctx.lineWidth = 2;
-  
+  if(calculatePERCLOSVariance(perclosHistory) > PERCLOS_VARIANCE_THRESHOLD) return true;
+  return false;
+}
+
+async function loadPhoneDetectionModel(){
+  try {
+    let attempts = 0;
+    while(typeof cocoSsd === 'undefined' && attempts < 50){
+      await new Promise(resolve => setTimeout(resolve, 100));
+      attempts++;
+    }
+    if(typeof cocoSsd === 'undefined'){
+      console.warn('COCO-SSD library not loaded. Phone detection will be unavailable.');
+      phoneStatusEl.innerText = "Unavailable";
+      phoneStatusEl.style.color = '#999';
+      return false;
+    }
+    
+    phoneStatusEl.innerText = "Loading...";
+    phoneStatusEl.style.color = '#ffa500';
+    
+    phoneDetectionModel = await Promise.race([
+      cocoSsd.load(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 30000))
+    ]);
+    
+    phoneStatusEl.innerText = "Ready";
+    phoneStatusEl.style.color = '#00ff00';
+    return true;
+  } catch(error){
+    console.warn('Phone detection unavailable (network/CDN issue):', error.message);
+    phoneStatusEl.innerText = "Unavailable";
+    phoneStatusEl.style.color = '#999';
+    phoneDetectionModel = null;
+    return false;
+  }
+}
+
+async function detectPhoneInFrame(videoElement){
+  if(!phoneDetectionModel) return [];
+  try {
+    const predictions = await phoneDetectionModel.detect(videoElement);
+    const phoneDetections = predictions
+      .filter(pred => pred.class === 'cell phone' && pred.score >= PHONE_DETECTION_CONFIDENCE)
+      .map(pred => {
+        const [x, y, width, height] = pred.bbox;
+        return {
+          bbox: [x, y, x + width, y + height],
+          confidence: pred.score,
+          class: 'cell phone'
+        };
+      });
+    
+    return phoneDetections;
+  } catch(error){
+    console.error('Phone detection error:', error);
+    return [];
+  }
+}
+
+function drawPhoneDetections(detections){
+  if(!detections || detections.length === 0) return;
+  detections.forEach(detection => {
+    const [x1, y1, x2, y2] = detection.bbox;
+    ctx.strokeStyle = '#ff0000';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.fillStyle = '#ff0000';
+    ctx.font = '16px Arial';
+    ctx.fillText(
+      `Phone ${(detection.confidence * 100).toFixed(0)}%`,
+      x1,
+      y1 - 5
+    );
+  });
+}
+
+function getEyePoints(landmarks, eyeIndices){
+  if(!landmarks || landmarks.length < Math.max(...eyeIndices) + 1) return null;
+  if(!canvas || canvas.width === 0 || canvas.height === 0) return null;
   const points = [];
   for(let i = 0; i < eyeIndices.length; i++){
     const idx = eyeIndices[i];
-    if(idx >= landmarks.length || !landmarks[idx]) {
-      return null; // If any landmark is missing, return null
-    }
-    
-    const landmark = landmarks[idx];
-    points.push({
-      x: landmark.x * canvas.width,
-      y: landmark.y * canvas.height
-    });
+    if(idx >= landmarks.length || !landmarks[idx]) return null;
+    const lm = landmarks[idx];
+    points.push({ x: lm.x * canvas.width, y: lm.y * canvas.height });
   }
-  
-  if(points.length !== 6) return null; // Need exactly 6 points for EAR
-  
-  // Draw all 6 points for EAR calculation
-  points.forEach((p, idx) => {
-    // Draw point as circle
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 3, 0, 2 * Math.PI);
-    ctx.fill();
-    
-    // Draw label with point index
-    ctx.fillStyle = color;
-    ctx.font = '10px Arial';
-    ctx.fillText(idx, p.x + 5, p.y - 5);
-    ctx.fillStyle = color;
-  });
-  
-  // Draw lines connecting the EAR points (visualize the triangle)
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1;
-  ctx.globalAlpha = 0.5;
-  
-  // Horizontal line (top to bottom)
-  ctx.beginPath();
-  ctx.moveTo(points[0].x, points[0].y);
-  ctx.lineTo(points[3].x, points[3].y);
-  ctx.stroke();
-  
-  // Vertical lines (left and right)
-  ctx.beginPath();
-  ctx.moveTo(points[1].x, points[1].y);
-  ctx.lineTo(points[5].x, points[5].y);
-  ctx.stroke();
-  
-  ctx.beginPath();
-  ctx.moveTo(points[2].x, points[2].y);
-  ctx.lineTo(points[4].x, points[4].y);
-  ctx.stroke();
-  
-  ctx.globalAlpha = 1.0;
-  
-  return points;
+  return points.length === 6 ? points : null;
 }
 
-/* --------- THEME SWITCHING --------- */
 const themeButtons = document.querySelectorAll("[data-theme-btn]");
 const bodyEl = document.body;
 
@@ -424,180 +479,222 @@ themeButtons.forEach(btn => {
   });
 });
 
-/* --------- FACEMESH --------- */
 const faceMesh = new FaceMesh({
   locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
 });
 faceMesh.setOptions({
   maxNumFaces: 1,
-  refineLandmarks: true
+  refineLandmarks: true,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
 });
 
 faceMesh.onResults(results => {
-  // Clear canvas
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  
-  // Draw video frame
   ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+  const currentTime = performance.now();
 
-  // Check if face is detected
   if(!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0){
-    if(noFaceSince === null){
-      noFaceSince = performance.now();
-    }
-    const noFaceTime = (performance.now() - noFaceSince) / 1000;
-    
-    // Reset other timers
-    eyesClosedSince = null;
-    lookingAwaySince = null;
+    if(noFaceSince === null) noFaceSince = currentTime;
+    eyeClosedSince = null;
+    eyesOpenSince = null;
+    occlusionDetectedSince = null;
     currentLeftEyePoints = null;
     currentRightEyePoints = null;
+    previousLeftEyePoints = null;
+    previousRightEyePoints = null;
+    perclosFrameHistory = [];
+    perclosHistory = [];
+    earHistory = [];
+    smoothedEarState = 'open';
+    if(currentFocusState !== FOCUS_STATE.FOCUSED){
+      currentFocusState = FOCUS_STATE.FOCUSED;
+      stopAlarm();
+    }
     
-    if(noFaceTime >= LOOK_AWAY_TIME_THRESHOLD){
-      statusEl.innerText = "⚠️ NO FACE DETECTED — Please look at the camera!";
+    const noFaceTime = (currentTime - noFaceSince) / 1000;
+    if(noFaceTime >= 1.0){
+      statusEl.innerText = "⚠️ Eyes not visible — Please look at the camera!";
       statusEl.className = "status-bad";
       startAlarm();
-      sessionStatusEl.innerText = "Away from Screen";
+      sessionStatusEl.innerText = "Looking Away";
       sessionStatusLabelEl.innerText = "Paused";
-      sessionStatusTextEl.innerText = "We’ll resume tracking once you’re back in view.";
+      sessionStatusTextEl.innerText = "Eyes not visible (looking away). We'll resume when you're back in view.";
     } else {
-      statusEl.innerText = "No face detected — Please look at the camera!";
+      statusEl.innerText = "Eyes not visible — Please look at the camera.";
       statusEl.className = "status-bad";
       stopAlarm();
       sessionStatusEl.innerText = "Not in View";
       sessionStatusLabelEl.innerText = "Idle";
-      sessionStatusTextEl.innerText = "When you’re ready, sit comfortably and look softly at the screen.";
+      sessionStatusTextEl.innerText = "When you're ready, look at the screen.";
     }
-    earEl.innerText = "-";
+    perclosEl.innerText = "-";
     return;
   }
-  
-  // Reset no face timer when face is detected
   noFaceSince = null;
-
   const landmarks = results.multiFaceLandmarks[0];
+  const leftEyeClosure = computeEyeClosure(landmarks, LEFT_EYE);
+  const rightEyeClosure = computeEyeClosure(landmarks, RIGHT_EYE);
+  const avgEyeClosure = (leftEyeClosure + rightEyeClosure) / 2;
+  currentLeftEyePoints = getEyePoints(landmarks, LEFT_EYE);
+  currentRightEyePoints = getEyePoints(landmarks, RIGHT_EYE);
 
-  // Calculate EAR for both eyes
-  const leftEAR = computeEAR(landmarks, LEFT_EYE);
-  const rightEAR = computeEAR(landmarks, RIGHT_EYE);
-  const avgEAR = (leftEAR + rightEAR) / 2;
+  earHistory.push(avgEyeClosure);
+  if(earHistory.length > EAR_SMOOTH_FRAMES) earHistory.shift();
+  const smoothedEAR = earHistory.length >= EAR_SMOOTH_FRAMES
+    ? earHistory.reduce((a, b) => a + b, 0) / earHistory.length
+    : avgEyeClosure;
+  if(smoothedEAR < EAR_THRESHOLD_CLOSED) smoothedEarState = 'closed';
+  else if(smoothedEAR > EAR_THRESHOLD_OPEN) smoothedEarState = 'open';
+  const isEyesClosedThisFrame = smoothedEarState === 'closed';
 
-  earEl.innerText = avgEAR.toFixed(3);
+  perclosFrameHistory.push({ timestamp: currentTime, isClosed: isEyesClosedThisFrame });
+  const windowStart = currentTime - (PERCLOS_WINDOW_SECONDS * 1000);
+  perclosFrameHistory = perclosFrameHistory.filter(frame => frame.timestamp >= windowStart);
+  const currentPERCLOS = calculatePERCLOS(perclosFrameHistory, PERCLOS_WINDOW_SECONDS);
+  perclosEl.innerText = `${currentPERCLOS.toFixed(1)}%`;
 
-  // Draw eye points on canvas for visualization
-  currentLeftEyePoints = drawEyePoints(landmarks, LEFT_EYE, '#00ff00'); // Green for left eye
-  currentRightEyePoints = drawEyePoints(landmarks, RIGHT_EYE, '#00ffff'); // Cyan for right eye
+  perclosHistory.push(currentPERCLOS);
+  if(perclosHistory.length > PERCLOS_HISTORY_SIZE) perclosHistory.shift();
 
-  // ---- LOOKING AWAY DETECTION (using EAR method) ----
-  // If EAR is very low, it means eyes are almost closed or looking away
-  // Also check if there's a significant drop in EAR (sudden change)
-  const isLookingAway = avgEAR < EAR_LOOK_AWAY_THRESHOLD || 
-                       (lastEAR > 0.25 && avgEAR < lastEAR - 0.1) ||
-                       leftEAR < 0.1 || rightEAR < 0.1;
-
-  if(isLookingAway){
-    if(lookingAwaySince === null){
-      lookingAwaySince = performance.now();
-    }
-    const awayTime = (performance.now() - lookingAwaySince) / 1000;
-    
-    // Reset drowsiness timer when looking away
-    eyesClosedSince = null;
-    
-    if(awayTime >= LOOK_AWAY_TIME_THRESHOLD){
-      statusEl.innerText = "⚠️ LOOKING AWAY — Please focus on the camera!";
-      statusEl.className = "status-bad";
-      startAlarm();
-      sessionStatusEl.innerText = "Looking Away";
-      sessionStatusLabelEl.innerText = "Gently Refocus";
-      sessionStatusTextEl.innerText = "Bring your attention back to the screen when you’re ready.";
-      lastEAR = avgEAR;
-      return;
-    } else {
-      statusEl.innerText = "Looking away…";
-      statusEl.className = "status-bad";
-      stopAlarm();
-      sessionStatusEl.innerText = "Brief Glance Away";
-      sessionStatusLabelEl.innerText = "Tracking";
-      sessionStatusTextEl.innerText = "Short glances away are okay. We’ll let you know if it continues.";
-      lastEAR = avgEAR;
-      return;
-    }
+  const isOcclusionDetected = detectOcclusion(
+    currentLeftEyePoints, 
+    currentRightEyePoints, 
+    avgEyeClosure, 
+    perclosHistory
+  );
+  if(isOcclusionDetected){
+    if(occlusionDetectedSince === null) occlusionDetectedSince = currentTime;
   } else {
-    // Reset looking away timer when back to camera
-    if(lookingAwaySince !== null){
-      lookingAwaySince = null;
-      stopAlarm();
-    }
+    occlusionDetectedSince = null;
   }
-
-  // ---- DROWSINESS DETECTION (only if not looking away) ----
-  if(avgEAR < EAR_THRESHOLD){
-    if(eyesClosedSince === null){
-      eyesClosedSince = performance.now();
-    }
-
-    // Blink detection: short closures that don't trigger drowsiness
-    if(!wasEyeClosed) {
-      wasEyeClosed = true;
-    }
-  } else {
-    // If eyes were closed briefly and reopen, count as blink
-    if(wasEyeClosed && eyesClosedSince !== null){
-      const closedTime = (performance.now() - eyesClosedSince) / 1000;
-      if(closedTime < CLOSED_TIME_THRESHOLD){
-        blinkCount += 1;
-        blinkEl.innerText = String(blinkCount);
-      }
-    }
-    wasEyeClosed = false;
-    eyesClosedSince = null;
+  const occlusionDuration = occlusionDetectedSince !== null 
+    ? (currentTime - occlusionDetectedSince) / 1000 
+    : 0;
+  const isOccluded = occlusionDuration >= OCCLUSION_DETECTION_TIME_SECONDS;
+  if(isOccluded){
+    eyeClosedSince = null;
+    eyesOpenSince = null;
+    if(currentFocusState !== FOCUS_STATE.EYES_OCCLUDED) currentFocusState = FOCUS_STATE.EYES_OCCLUDED;
+    statusEl.innerText = "⚠️ Eyes Occluded — Please ensure eyes are clearly visible!";
+    statusEl.className = "status-bad";
+    sessionStatusEl.innerText = "Eyes Occluded";
+    sessionStatusLabelEl.innerText = "Not Focused";
+    sessionStatusTextEl.innerText = "We cannot reliably detect your eyes. Please remove any obstructions.";
     stopAlarm();
+    previousLeftEyePoints = currentLeftEyePoints;
+    previousRightEyePoints = currentRightEyePoints;
+    return;
   }
+  occlusionDetectedSince = null;
+  previousLeftEyePoints = currentLeftEyePoints;
+  previousRightEyePoints = currentRightEyePoints;
 
-  if(eyesClosedSince !== null){
-    const closedTime = (performance.now() - eyesClosedSince) / 1000;
-
-    if(closedTime >= CLOSED_TIME_THRESHOLD){
-      statusEl.innerText = "DROWSY — WAKE UP!";
-      statusEl.className = "status-bad";
-      startAlarm();
-      sessionStatusEl.innerText = "Drowsy";
-      sessionStatusLabelEl.innerText = "Alert";
-      sessionStatusTextEl.innerText = "Your eyes have been closed for a while. Time for a short break.";
-    } else {
-      statusEl.innerText = `Eyes closed… (${closedTime.toFixed(1)}s)`;
-      statusEl.className = "status-bad";
-      sessionStatusEl.innerText = "Eyes Closed";
-      sessionStatusLabelEl.innerText = "Tracking";
-      sessionStatusTextEl.innerText = "We’ll gently remind you if this continues.";
-    }
+  if(isEyesClosedThisFrame){
+    if(eyeClosedSince === null) eyeClosedSince = currentTime;
   } else {
+    eyeClosedSince = null;
+  }
+  const closedDurationMs = eyeClosedSince !== null ? currentTime - eyeClosedSince : 0;
+  const closedDurationSec = closedDurationMs / 1000;
+  const isSustainedClosure = closedDurationMs >= MIN_CLOSURE_BEFORE_COUNT_MS;
+  const isEyesClosed = isEyesClosedThisFrame && isSustainedClosure;
+
+  if(isEyesClosed && closedDurationSec >= EYES_CLOSED_WARNING_SECONDS){
+    currentFocusState = FOCUS_STATE.ALERT;
+    statusEl.innerText = "⚠️ Eyes not visible — closed 5+ seconds. Please stay alert!";
+    statusEl.className = "status-bad";
+    startAlarm();
+    sessionStatusEl.innerText = "Eyes Not Visible";
+    sessionStatusLabelEl.innerText = "Alert";
+    sessionStatusTextEl.innerText = "Eyes closed 5+ seconds (blinks ignored). Possible drowsiness.";
+  } else if(isEyesClosed){
+    currentFocusState = FOCUS_STATE.FOCUSED;
+    stopAlarm();
+    statusEl.innerText = `Eyes closed (${closedDurationSec.toFixed(1)}s) — warning at 5s`;
+    statusEl.className = "status-ok";
+    sessionStatusEl.innerText = "Eyes Closed";
+    sessionStatusLabelEl.innerText = "Tracking";
+    sessionStatusTextEl.innerText = "Brief closure. Warning only if eyes stay closed 5+ seconds.";
+  } else {
+    stopAlarm();
+    currentFocusState = FOCUS_STATE.FOCUSED;
     statusEl.innerText = "Focused ✓";
     statusEl.className = "status-ok";
     sessionStatusEl.innerText = "Focused";
     sessionStatusLabelEl.innerText = "Calm Focus";
-    sessionStatusTextEl.innerText = "Soft gaze on the screen. You’re doing great.";
+    sessionStatusTextEl.innerText = "Smoothed EAR + hysteresis: warning only when eyes closed 5+ sec (blinks ignored).";
   }
 
-  lastEAR = avgEAR;
+  phoneDetectionFrameCount++;
+  if(phoneDetectionFrameCount >= PHONE_DETECTION_INTERVAL){
+    phoneDetectionFrameCount = 0;
+    detectPhoneInFrame(video).then(detections => {
+      const phoneDetected = detections.length > 0;
+      if(phoneDetected){
+        if(phoneDetectedSince === null) phoneDetectedSince = currentTime;
+        const phoneDuration = (performance.now() - phoneDetectedSince) / 1000;
+        phoneStatusEl.innerText = `Detected (${phoneDuration.toFixed(1)}s)`;
+        phoneStatusEl.style.color = '#ff0000';
+        drawPhoneDetections(detections);
+        if(phoneDuration >= PHONE_ALERT_DURATION_SECONDS && statusEl.innerText.includes("Focused")){
+            statusEl.innerText = "⚠️ Phone Detected — Please put your phone away!";
+            statusEl.className = "status-bad";
+            startAlarm();
+            sessionStatusEl.innerText = "Phone Detected";
+            sessionStatusLabelEl.innerText = "Distraction";
+            sessionStatusTextEl.innerText = "A phone has been detected. Please put it away to maintain focus.";
+        }
+      } else {
+        phoneDetectedSince = null;
+        phoneStatusEl.innerText = "Not Detected";
+        phoneStatusEl.style.color = '';
+      }
+    }).catch(error => {
+      console.error('Phone detection error:', error);
+    });
+  }
+  previousLeftEyePoints = currentLeftEyePoints;
+  previousRightEyePoints = currentRightEyePoints;
 });
 
-/* --------- CAMERA LOOP --------- */
 async function startCamera(){
-  stream = await navigator.mediaDevices.getUserMedia({ video:true });
-  video.srcObject = stream;
-  await video.play();
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video:true });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    
+    if(!phoneDetectionModel){
+      loadPhoneDetectionModel().catch(() => {
+        phoneStatusEl.innerText = "Unavailable";
+        phoneStatusEl.style.color = '#999';
+      });
+    }
 
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-
-  async function loop(){
-    if(!stream) return;
-    await faceMesh.send({ image: video });
-    requestAnimationFrame(loop);
+    async function loop(){
+      if(!stream) return;
+      await faceMesh.send({ image: video });
+      requestAnimationFrame(loop);
+    }
+    loop();
+  } catch(error){
+    if(error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError'){
+      alert('Camera permission denied. Please allow camera access and try again.');
+      phoneStatusEl.innerText = "Camera Denied";
+      phoneStatusEl.style.color = '#ff0000';
+    } else if(error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError'){
+      alert('No camera found. Please connect a camera and try again.');
+      phoneStatusEl.innerText = "No Camera";
+      phoneStatusEl.style.color = '#ff0000';
+    } else {
+      alert('Failed to start camera: ' + error.message);
+      phoneStatusEl.innerText = "Error";
+      phoneStatusEl.style.color = '#ff0000';
+    }
+    console.error('Camera error:', error);
   }
-  loop();
 }
 
 function stopCamera(){
@@ -606,15 +703,43 @@ function stopCamera(){
     stream = null;
   }
   stopAlarm();
-  eyesClosedSince = null;
-  lookingAwaySince = null;
+  currentFocusState = FOCUS_STATE.FOCUSED;
+  eyeClosedSince = null;
+  eyesOpenSince = null;
   noFaceSince = null;
+  occlusionDetectedSince = null;
+  previousLeftEyePoints = null;
+  previousRightEyePoints = null;
+  perclosFrameHistory = [];
+  perclosHistory = [];
+  phoneDetectedSince = null;
+  phoneDetectionFrameCount = 0;
+  isPhoneDetected = false;
+  earHistory = [];
+  smoothedEarState = 'open';
+  perclosEl.innerText = "-";
+  phoneStatusEl.innerText = "Not Detected";
+  phoneStatusEl.style.color = '';
   statusEl.innerText = "Stopped";
 }
 
-/* --------- INITIALIZE TIMER ON PAGE LOAD --------- */
+const TIPS = [
+  "Warning triggers only after 5+ seconds of eyes closed — blinks are ignored.",
+  "PERCLOS measures % of time eyes are closed over the last 60 seconds.",
+  "Keep your face in view for best detection. Looking away shows \"Eyes not visible\".",
+  "The study timer can run independently — set it and start your session.",
+  "Smoothed EAR + hysteresis reduces false alerts from brief eye movements.",
+];
+let tipIndex = 0;
+function cycleTip() {
+  const el = document.getElementById('tipText');
+  if (el) { el.textContent = TIPS[tipIndex % TIPS.length]; tipIndex++; }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   updateTimerDisplay();
+  cycleTip();
+  setInterval(cycleTip, 8000);
 });
 </script>
 
